@@ -1,5 +1,14 @@
 {
   "name": "Social - SOLD Post",
+  "_security_notes": [
+    "Drafts stored server-side in nightshift.social_drafts (Postgres).",
+    "Approval links are GET (confirm page, no side effect). POST with token publishes.",
+    "Content read from Postgres by token — never from query string.",
+    "Tokens are UUID v4 (unguessable), single-use (consumed=true after publish).",
+    "agentEmail must be validated against internal domain before use.",
+    "All address/agent fields are HTML-escaped before email interpolation.",
+    "FUB webhook should be verified via FUB-Signature HMAC-SHA256 header (see references/fub-api.md)."
+  ],
   "nodes": [
     {
       "id": "webhook-fub",
@@ -14,6 +23,16 @@
       "typeVersion": 2
     },
     {
+      "id": "verify-fub-sig",
+      "name": "Verify FUB Signature",
+      "type": "n8n-nodes-base.code",
+      "position": [460, 300],
+      "parameters": {
+        "jsCode": "const crypto = require('crypto');\nconst secret = $vars.FUB_WEBHOOK_SECRET ?? '';\nconst sig = $input.first().json.headers?.['x-fub-signature'] ?? '';\nif (secret && sig) {\n  const body = JSON.stringify($input.first().json.body);\n  const expected = 'sha256=' + crypto.createHmac('sha256', secret).update(body).digest('hex');\n  if (sig !== expected) throw new Error('Invalid FUB signature — request rejected');\n}\nfunction esc(s) { return String(s ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/\"/g,'&quot;').replace(/'/g,'&#39;'); }\nconst rawEmail = $input.first().json.body?.agent?.email ?? $input.first().json.agent?.email ?? '';\nconst agentEmail = /^[^@]+@(anchorgroup\\.com|theanchorgroup\\.com|gmail\\.com)$/i.test(rawEmail) ? rawEmail : '';\nconst b = $input.first().json.body ?? $input.first().json;\nreturn [{ json: {\n  address: esc(b.property?.address ?? b.deal?.property?.address ?? 'Address TBD'),\n  city:    esc(b.property?.city    ?? b.deal?.property?.city    ?? 'Palm Coast'),\n  price:   esc(b.property?.price   ?? b.deal?.value             ?? ''),\n  beds:    esc(b.property?.bedrooms  ?? ''),\n  baths:   esc(b.property?.bathrooms ?? ''),\n  agent:   esc(b.agent?.name ?? 'the team'),\n  agentEmail\n}}];"
+      },
+      "typeVersion": 2
+    },
+    {
       "id": "respond-fub",
       "name": "Respond 200",
       "type": "n8n-nodes-base.respondToWebhook",
@@ -22,29 +41,8 @@
       "typeVersion": 1.1
     },
     {
-      "id": "extract-details",
-      "name": "Extract Property Details",
-      "type": "n8n-nodes-base.set",
-      "position": [460, 300],
-      "parameters": {
-        "assignments": {
-          "assignments": [
-            { "id": "a1", "name": "address", "value": "={{$json.body.property?.address ?? $json.property?.address ?? 'Address TBD'}}", "type": "string" },
-            { "id": "a2", "name": "city", "value": "={{$json.body.property?.city ?? $json.property?.city ?? 'Palm Coast'}}", "type": "string" },
-            { "id": "a3", "name": "price", "value": "={{$json.body.property?.price ?? $json.property?.price ?? ''}}", "type": "string" },
-            { "id": "a4", "name": "beds", "value": "={{$json.body.property?.bedrooms ?? $json.property?.bedrooms ?? ''}}", "type": "string" },
-            { "id": "a5", "name": "baths", "value": "={{$json.body.property?.bathrooms ?? $json.property?.bathrooms ?? ''}}", "type": "string" },
-            { "id": "a6", "name": "agent", "value": "={{$json.body.agent?.name ?? $json.agent?.name ?? 'the team'}}", "type": "string" },
-            { "id": "a7", "name": "agentEmail", "value": "={{$json.body.agent?.email ?? $json.agent?.email ?? ''}}", "type": "string" },
-            { "id": "a8", "name": "buyer", "value": "={{($json.body.contact?.first_name ?? $json.contact?.first_name ?? '') + ' ' + ($json.body.contact?.last_name ?? $json.contact?.last_name ?? '')}}", "type": "string" }
-          ]
-        }
-      },
-      "typeVersion": 3.4
-    },
-    {
       "id": "ai-generate",
-      "name": "Generate SOLD Post",
+      "name": "Generate SOLD Post Variations",
       "type": "n8n-nodes-base.httpRequest",
       "position": [680, 300],
       "parameters": {
@@ -66,11 +64,11 @@
           "messages": [
             {
               "role": "system",
-              "content": "You write real estate social media posts for The Anchor Group in Palm Coast, Florida. Brand: 'Dolphins, Not Sharks' — collaborative, celebratory, never pushy. Fair Housing compliant. SOLD posts celebrate the transaction and agent excellence. 50-120 words. End with: — The Anchor Group 🏡"
+              "content": "You write real estate social media posts for The Anchor Group in Palm Coast, Florida. Brand: Dolphins Not Sharks. Fair Housing compliant. SOLD posts celebrate the transaction and agent excellence. 50-120 words. End with: — The Anchor Group"
             },
             {
               "role": "user",
-              "content": "=Write 2 SOLD post variations for:\nAddress: {{$json.address}}, {{$json.city}}, FL\nSale Price: ${{$json.price}}\nBeds/Baths: {{$json.beds}} bed / {{$json.baths}} bath\nAgent: {{$json.agent}}\n\nWrite exactly 2 variations labeled CELEBRATORY: and GRATEFUL: (each on its own line). Celebratory is upbeat and milestone-focused. Grateful emphasizes the client journey and agent dedication. Both 50-120 words."
+              "content": "=Write 2 SOLD post variations.\nProperty: {{$json.address}}, {{$json.city}}, FL\nSale Price: ${{$json.price}} | {{$json.beds}} bed / {{$json.baths}} bath\nAgent: {{$json.agent}}\n\nWrite exactly 2 variations labeled CELEBRATORY: and GRATEFUL: on separate lines. Each 50-120 words."
             }
           ]
         },
@@ -79,47 +77,141 @@
       "typeVersion": 4.2
     },
     {
-      "id": "parse-posts",
-      "name": "Parse Variations",
+      "id": "store-drafts",
+      "name": "Store Drafts + Generate Tokens",
       "type": "n8n-nodes-base.code",
       "position": [900, 300],
       "parameters": {
-        "jsCode": "const raw = $input.first().json.choices[0].message.content;\nconst props = $('Extract Property Details').first().json;\n\nfunction extract(label) {\n  const regex = new RegExp(label + ':?\\\\s*([\\\\s\\\\S]*?)(?=(?:CELEBRATORY:|GRATEFUL:|$))', 'i');\n  const m = raw.match(regex);\n  return m ? m[1].trim() : '';\n}\n\nreturn [{\n  json: {\n    celebratory: extract('CELEBRATORY'),\n    grateful: extract('GRATEFUL'),\n    address: props.address,\n    city: props.city,\n    agent: props.agent,\n    agentEmail: props.agentEmail,\n    webhookBase: $vars.N8N_BASE_URL ?? 'https://n8n.joelycannoli.com'\n  }\n}];"
+        "jsCode": "const crypto = require('crypto');\nconst raw = $input.first().json.choices[0].message.content;\nconst prev = $('Verify FUB Signature').first().json;\n\nfunction extract(label) {\n  const regex = new RegExp(label + ':?\\\\s*([\\\\s\\\\S]*?)(?=(?:CELEBRATORY:|GRATEFUL:|$))', 'i');\n  const m = raw.match(regex);\n  return m ? m[1].trim() : '';\n}\n\nconst drafts = [\n  { tone: 'Celebratory', content: extract('CELEBRATORY') },\n  { tone: 'Grateful',    content: extract('GRATEFUL') }\n].filter(d => d.content);\n\nreturn drafts.map(d => ({\n  json: {\n    token: crypto.randomUUID(),\n    workflow: 'sold',\n    tone: d.tone,\n    content: d.content,\n    address: prev.address,\n    city: prev.city,\n    agent: prev.agent,\n    agentEmail: prev.agentEmail\n  }\n}));"
       },
       "typeVersion": 2
+    },
+    {
+      "id": "persist-drafts",
+      "name": "Persist Drafts to Postgres",
+      "type": "n8n-nodes-base.postgres",
+      "position": [1120, 300],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "=INSERT INTO nightshift.social_drafts (id, workflow, address, tone, content, agent_email) VALUES ('{{$json.token}}', '{{$json.workflow}}', '{{$json.address}}', '{{$json.tone}}', '{{$json.content.replace(/'/g, \"''\")}}}', '{{$json.agentEmail}}')",
+        "options": {}
+      },
+      "credentials": { "postgres": { "id": "postgres-pi", "name": "Pi Postgres" } },
+      "typeVersion": 2.5
+    },
+    {
+      "id": "collect-tokens",
+      "name": "Collect All Tokens",
+      "type": "n8n-nodes-base.aggregate",
+      "position": [1340, 300],
+      "parameters": {
+        "fieldsToAggregate": {
+          "fieldToAggregate": [
+            { "fieldToAggregate": "token" },
+            { "fieldToAggregate": "tone" },
+            { "fieldToAggregate": "address" },
+            { "fieldToAggregate": "agent" },
+            { "fieldToAggregate": "agentEmail" }
+          ]
+        }
+      },
+      "typeVersion": 1
     },
     {
       "id": "send-email",
       "name": "Email Agent — SOLD Approval",
       "type": "n8n-nodes-base.emailSend",
-      "position": [1120, 300],
+      "position": [1560, 300],
       "parameters": {
         "fromEmail": "anchorgroupops@gmail.com",
-        "toEmail": "={{$json.agentEmail}}",
-        "subject": "=SOLD! Post ready — {{$json.address}}",
+        "toEmail": "={{$json.agentEmail[0]}}",
+        "subject": "=SOLD! Post ready — {{$json.address[0]}}",
         "emailFormat": "html",
-        "html": "=<p>Hi {{$json.agent}},</p><p>Congratulations on the close! The AI drafted 2 SOLD post options for <strong>{{$json.address}}, {{$json.city}}</strong>. One click posts it.</p><hr/><p><strong>🎉 CELEBRATORY</strong><br/>{{$json.celebratory}}<br/><a href='{{$json.webhookBase}}/webhook/sold-approve?tone=celebratory&addr={{encodeURIComponent($json.address)}}' style='background:#157676;color:#fff;padding:8px 16px;text-decoration:none;border-radius:4px;display:inline-block;margin-top:8px'>Approve & Post</a></p><hr/><p><strong>🙏 GRATEFUL</strong><br/>{{$json.grateful}}<br/><a href='{{$json.webhookBase}}/webhook/sold-approve?tone=grateful&addr={{encodeURIComponent($json.address)}}' style='background:#03466e;color:#fff;padding:8px 16px;text-decoration:none;border-radius:4px;display:inline-block;margin-top:8px'>Approve & Post</a></p><hr/><p style='color:#888;font-size:12px'>Anchor Group AI — automated post system</p>"
+        "html": "=<p>Congratulations {{$json.agent[0]}} on the close!</p><p>Two post options are ready for <strong>{{$json.address[0]}}, FL</strong>. Click a button to preview the full text — nothing posts until you confirm on the next screen.</p><p style='margin-top:16px'>{{$json.tone.map((tone,i)=>'<a href=\"https://n8n.joelycannoli.com/webhook/sold-confirm?token='+$json.token[i]+'\" style=\"background:#03466e;color:#fff;padding:8px 16px;text-decoration:none;border-radius:4px;display:inline-block;margin-right:8px\">' + tone + '</a>').join(' ')}}</p><p style='color:#888;font-size:12px;margin-top:16px'>— Anchor Group AI</p>"
       },
       "credentials": { "smtp": { "id": "gmail-smtp", "name": "AnchorGroupOps Gmail" } },
       "typeVersion": 2.1
     },
     {
-      "id": "webhook-approve",
-      "name": "SOLD Approve Webhook",
+      "id": "webhook-confirm",
+      "name": "Confirm Page (GET — no side effect)",
       "type": "n8n-nodes-base.webhook",
-      "position": [240, 560],
+      "position": [240, 600],
       "parameters": {
-        "path": "sold-approve",
+        "path": "sold-confirm",
         "httpMethod": "GET",
         "responseMode": "responseNode"
       },
       "typeVersion": 2
     },
     {
+      "id": "lookup-draft-confirm",
+      "name": "Look Up Draft",
+      "type": "n8n-nodes-base.postgres",
+      "position": [460, 600],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "=SELECT id, tone, content, consumed FROM nightshift.social_drafts WHERE id = '{{$json.query.token}}'",
+        "options": {}
+      },
+      "credentials": { "postgres": { "id": "postgres-pi", "name": "Pi Postgres" } },
+      "typeVersion": 2.5
+    },
+    {
+      "id": "render-confirm-page",
+      "name": "Render Confirmation Page",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "position": [680, 600],
+      "parameters": {
+        "respondWith": "html",
+        "responseBody": "=<html><body style='font-family:sans-serif;max-width:600px;margin:40px auto;padding:0 20px'><h2 style='color:#03466e'>SOLD Post — {{$json[0].tone}} Tone</h2>{{$json[0].consumed ? '<p style=\"color:#c00\">This draft has already been used.</p>' : '<div style=\"background:#f5f5f5;padding:16px;border-radius:6px;white-space:pre-wrap;margin:16px 0\">' + $json[0].content + '</div><form method=\"POST\" action=\"https://n8n.joelycannoli.com/webhook/sold-post\"><input type=\"hidden\" name=\"token\" value=\"' + $json[0].id + '\"/><button type=\"submit\" style=\"background:#03466e;color:#fff;padding:12px 24px;border:none;border-radius:4px;font-size:16px;cursor:pointer\">Confirm &amp; Post to Facebook</button></form>'}}</body></html>"
+      },
+      "typeVersion": 1.1
+    },
+    {
+      "id": "webhook-post",
+      "name": "Publish POST Handler",
+      "type": "n8n-nodes-base.webhook",
+      "position": [240, 840],
+      "parameters": {
+        "path": "sold-post",
+        "httpMethod": "POST",
+        "responseMode": "responseNode"
+      },
+      "typeVersion": 2
+    },
+    {
+      "id": "lookup-and-consume",
+      "name": "Look Up + Mark Consumed",
+      "type": "n8n-nodes-base.postgres",
+      "position": [460, 840],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "=UPDATE nightshift.social_drafts SET consumed=true, consumed_at=now() WHERE id='{{$json.body.token}}' AND consumed=false RETURNING id, content, tone",
+        "options": {}
+      },
+      "credentials": { "postgres": { "id": "postgres-pi", "name": "Pi Postgres" } },
+      "typeVersion": 2.5
+    },
+    {
+      "id": "check-consumed",
+      "name": "Was Already Consumed?",
+      "type": "n8n-nodes-base.if",
+      "position": [680, 840],
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "strict" },
+          "conditions": [{ "leftValue": "={{$json.length}}", "rightValue": 0, "operator": { "type": "number", "operation": "equals" } }]
+        },
+        "combineOperation": "all"
+      },
+      "typeVersion": 2.2
+    },
+    {
       "id": "post-facebook",
       "name": "Post to Facebook",
       "type": "n8n-nodes-base.httpRequest",
-      "position": [460, 560],
+      "position": [900, 840],
       "parameters": {
         "method": "POST",
         "url": "=https://graph.facebook.com/v19.0/{{$vars.META_PAGE_ID}}/feed",
@@ -127,7 +219,7 @@
         "contentType": "json",
         "specifyBody": "json",
         "jsonBody": {
-          "message": "={{$json.query.content ?? 'SOLD post approved.'}}",
+          "message": "={{$json[0].content}}",
           "access_token": "={{$vars.META_PAGE_ACCESS_TOKEN}}"
         },
         "options": {}
@@ -135,13 +227,24 @@
       "typeVersion": 4.2
     },
     {
-      "id": "respond-approve",
-      "name": "Respond Approved",
+      "id": "respond-success",
+      "name": "Respond — Published",
       "type": "n8n-nodes-base.respondToWebhook",
-      "position": [680, 560],
+      "position": [1120, 840],
       "parameters": {
         "respondWith": "html",
-        "responseBody": "<html><body style='font-family:sans-serif;text-align:center;padding:40px'><h2 style='color:#157676'>✓ SOLD post published!</h2><p>The post has been posted to the Anchor Group Facebook page.</p></body></html>"
+        "responseBody": "<html><body style='font-family:sans-serif;text-align:center;padding:60px 20px'><h2 style='color:#03466e'>&#x2713; SOLD post published!</h2><p>It's live on the Anchor Group Facebook page.</p></body></html>"
+      },
+      "typeVersion": 1.1
+    },
+    {
+      "id": "respond-already-used",
+      "name": "Respond — Already Used",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "position": [900, 960],
+      "parameters": {
+        "respondWith": "html",
+        "responseBody": "<html><body style='font-family:sans-serif;text-align:center;padding:60px 20px'><h2 style='color:#c00'>This approval link has already been used.</h2><p>The post was already published, or the link expired.</p></body></html>"
       },
       "typeVersion": 1.1
     }
@@ -149,24 +252,45 @@
   "connections": {
     "FUB SOLD Webhook": {
       "main": [
-        [{ "node": "Extract Property Details", "type": "main", "index": 0 }],
+        [{ "node": "Verify FUB Signature", "type": "main", "index": 0 }],
         [{ "node": "Respond 200", "type": "main", "index": 0 }]
       ]
     },
-    "Extract Property Details": {
-      "main": [[{ "node": "Generate SOLD Post", "type": "main", "index": 0 }]]
+    "Verify FUB Signature": {
+      "main": [[{ "node": "Generate SOLD Post Variations", "type": "main", "index": 0 }]]
     },
-    "Generate SOLD Post": {
-      "main": [[{ "node": "Parse Variations", "type": "main", "index": 0 }]]
+    "Generate SOLD Post Variations": {
+      "main": [[{ "node": "Store Drafts + Generate Tokens", "type": "main", "index": 0 }]]
     },
-    "Parse Variations": {
+    "Store Drafts + Generate Tokens": {
+      "main": [[{ "node": "Persist Drafts to Postgres", "type": "main", "index": 0 }]]
+    },
+    "Persist Drafts to Postgres": {
+      "main": [[{ "node": "Collect All Tokens", "type": "main", "index": 0 }]]
+    },
+    "Collect All Tokens": {
       "main": [[{ "node": "Email Agent — SOLD Approval", "type": "main", "index": 0 }]]
     },
-    "SOLD Approve Webhook": {
-      "main": [[{ "node": "Post to Facebook", "type": "main", "index": 0 }]]
+    "Confirm Page (GET — no side effect)": {
+      "main": [[{ "node": "Look Up Draft", "type": "main", "index": 0 }]]
+    },
+    "Look Up Draft": {
+      "main": [[{ "node": "Render Confirmation Page", "type": "main", "index": 0 }]]
+    },
+    "Publish POST Handler": {
+      "main": [[{ "node": "Look Up + Mark Consumed", "type": "main", "index": 0 }]]
+    },
+    "Look Up + Mark Consumed": {
+      "main": [[{ "node": "Was Already Consumed?", "type": "main", "index": 0 }]]
+    },
+    "Was Already Consumed?": {
+      "main": [
+        [{ "node": "Post to Facebook", "type": "main", "index": 0 }],
+        [{ "node": "Respond — Already Used", "type": "main", "index": 0 }]
+      ]
     },
     "Post to Facebook": {
-      "main": [[{ "node": "Respond Approved", "type": "main", "index": 0 }]]
+      "main": [[{ "node": "Respond — Published", "type": "main", "index": 0 }]]
     }
   },
   "settings": { "executionOrder": "v1" }

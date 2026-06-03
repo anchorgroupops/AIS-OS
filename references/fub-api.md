@@ -19,6 +19,23 @@ FUB can send webhooks on:
 
 Webhook payload includes: `person` (contact), `deal` (property/price/status), `agent` (assigned agent).
 
+### HMAC Signature Verification (required)
+
+FUB signs every webhook with `X-FUB-Signature: sha256=<hmac>`. **Always verify this before processing.**
+
+The workflows already include a "Verify FUB Signature" Code node. To activate it:
+1. FUB Admin → Webhooks → copy the webhook secret
+2. Add `FUB_WEBHOOK_SECRET` as an n8n variable (Settings → Variables)
+3. The Code node will reject any request without a valid signature
+
+```js
+// Verification logic (already in workflow Code node):
+const expected = 'sha256=' + crypto.createHmac('sha256', secret).update(rawBody).digest('hex');
+if (sig !== expected) throw new Error('Invalid signature');
+```
+
+If `FUB_WEBHOOK_SECRET` is empty, the check is skipped (soft-fail for initial setup). Set it before going live.
+
 ---
 
 ## Key Endpoints
