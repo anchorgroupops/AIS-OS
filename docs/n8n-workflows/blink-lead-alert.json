@@ -1,0 +1,63 @@
+{
+  "name": "Blink - Lead Alert",
+  "nodes": [
+    {
+      "id": "webhook1",
+      "name": "Lead Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "position": [240, 300],
+      "parameters": {
+        "path": "blink-lead-alert",
+        "httpMethod": "POST",
+        "responseMode": "responseNode"
+      },
+      "typeVersion": 2
+    },
+    {
+      "id": "respond1",
+      "name": "Respond 200",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "position": [460, 420],
+      "parameters": {
+        "respondWith": "text",
+        "responseBody": "ok"
+      },
+      "typeVersion": 1.1
+    },
+    {
+      "id": "blink1",
+      "name": "Post Lead Alert to Blink",
+      "type": "n8n-nodes-base.httpRequest",
+      "position": [460, 300],
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.joinblink.com/v2/feed/post",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Authorization", "value": "Bearer {{$vars.BLINK_API_TOKEN}}" }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "json",
+        "specifyBody": "json",
+        "jsonBody": {
+          "category": "={{$vars.BLINK_CATEGORY}}",
+          "title": "New Lead Assigned",
+          "body": "=🔔 New lead: {{$json.body.name ?? $json.name ?? 'Unknown'}}\nSource: {{$json.body.source ?? $json.source ?? '—'}} | Phone: {{$json.body.phone ?? $json.phone ?? '—'}}\n⚡ Call within 5 min — Zillow Preferred scoring"
+        },
+        "options": {}
+      },
+      "typeVersion": 4.2
+    }
+  ],
+  "connections": {
+    "Lead Webhook": {
+      "main": [
+        [{ "node": "Post Lead Alert to Blink", "type": "main", "index": 0 }],
+        [{ "node": "Respond 200", "type": "main", "index": 0 }]
+      ]
+    }
+  },
+  "settings": { "executionOrder": "v1" }
+}

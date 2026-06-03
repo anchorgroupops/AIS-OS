@@ -1,0 +1,114 @@
+{
+  "name": "Blink - On-Demand Digest",
+  "nodes": [
+    {
+      "id": "webhook1",
+      "name": "Trigger Digest",
+      "type": "n8n-nodes-base.webhook",
+      "position": [240, 300],
+      "parameters": {
+        "path": "blink-digest",
+        "httpMethod": "POST",
+        "responseMode": "responseNode"
+      },
+      "typeVersion": 2
+    },
+    {
+      "id": "postgres1",
+      "name": "Get Week Activity",
+      "type": "n8n-nodes-base.postgres",
+      "position": [460, 300],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT category, COUNT(*) AS jobs, COALESCE(SUM(CASE category WHEN 'incomplete' THEN 15 WHEN 'code-quality' THEN 15 WHEN 'dep-audit' THEN 15 WHEN 'aios-review' THEN 5 WHEN 'n8n-audit' THEN 5 ELSE 2 END),0) AS mins FROM nightshift.history WHERE completed_at >= date_trunc('week', now()) GROUP BY category ORDER BY jobs DESC",
+        "options": {}
+      },
+      "credentials": { "postgres": { "id": "postgres-pi", "name": "Pi Postgres" } },
+      "typeVersion": 2.5
+    },
+    {
+      "id": "ai1",
+      "name": "AI Digest Summary",
+      "type": "n8n-nodes-base.httpRequest",
+      "position": [680, 300],
+      "parameters": {
+        "method": "POST",
+        "url": "https://openrouter.ai/api/v1/chat/completions",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Authorization", "value": "Bearer {{$vars.OPENROUTER_API_KEY}}" },
+            { "name": "HTTP-Referer", "value": "https://n8n.joelycannoli.com" }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "json",
+        "specifyBody": "json",
+        "jsonBody": {
+          "model": "anthropic/claude-haiku-4-5",
+          "max_tokens": 200,
+          "messages": [
+            {
+              "role": "user",
+              "content": "=Here is the AI automation activity for the Anchor Group this week:\n{{JSON.stringify($input.all().map(r=>r.json), null, 2)}}\n\nWrite a concise 3-4 sentence digest for the team: what was automated, estimated time saved, and one forward-looking note. Plain text."
+            }
+          ]
+        },
+        "options": {}
+      },
+      "typeVersion": 4.2
+    },
+    {
+      "id": "blink1",
+      "name": "Post Digest to Blink",
+      "type": "n8n-nodes-base.httpRequest",
+      "position": [900, 300],
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.joinblink.com/v2/feed/post",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Authorization", "value": "Bearer {{$vars.BLINK_API_TOKEN}}" }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "json",
+        "specifyBody": "json",
+        "jsonBody": {
+          "category": "={{$vars.BLINK_CATEGORY}}",
+          "title": "AI Weekly Digest",
+          "body": "={{$json.choices[0].message.content}}"
+        },
+        "options": {}
+      },
+      "typeVersion": 4.2
+    },
+    {
+      "id": "respond1",
+      "name": "Respond 200",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "position": [900, 420],
+      "parameters": {
+        "respondWith": "text",
+        "responseBody": "ok"
+      },
+      "typeVersion": 1.1
+    }
+  ],
+  "connections": {
+    "Trigger Digest": {
+      "main": [[{ "node": "Get Week Activity", "type": "main", "index": 0 }]]
+    },
+    "Get Week Activity": {
+      "main": [[{ "node": "AI Digest Summary", "type": "main", "index": 0 }]]
+    },
+    "AI Digest Summary": {
+      "main": [
+        [{ "node": "Post Digest to Blink", "type": "main", "index": 0 }],
+        [{ "node": "Respond 200", "type": "main", "index": 0 }]
+      ]
+    }
+  },
+  "settings": { "executionOrder": "v1" }
+}

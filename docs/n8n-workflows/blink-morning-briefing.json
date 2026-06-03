@@ -1,0 +1,86 @@
+{
+  "name": "Blink - Morning Briefing",
+  "nodes": [
+    {
+      "id": "sched1",
+      "name": "Schedule 7:30 AM",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "position": [240, 300],
+      "parameters": {
+        "rule": {
+          "interval": [
+            { "field": "cronExpression", "expression": "30 7 * * 1-5" }
+          ]
+        }
+      },
+      "typeVersion": 1.2
+    },
+    {
+      "id": "ai1",
+      "name": "Draft Briefing",
+      "type": "n8n-nodes-base.httpRequest",
+      "position": [460, 300],
+      "parameters": {
+        "method": "POST",
+        "url": "https://openrouter.ai/api/v1/chat/completions",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Authorization", "value": "Bearer {{$vars.OPENROUTER_API_KEY}}" },
+            { "name": "HTTP-Referer", "value": "https://n8n.joelycannoli.com" }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "json",
+        "specifyBody": "json",
+        "jsonBody": {
+          "model": "anthropic/claude-haiku-4-5",
+          "max_tokens": 150,
+          "messages": [
+            {
+              "role": "user",
+              "content": "Write a concise Anchor Group team morning message. 3 short bullets: (1) today's real estate ops focus, (2) Zillow Preferred lead callback speed reminder, (3) one motivational line. Under 60 words total. Plain text, no markdown, no greeting line."
+            }
+          ]
+        },
+        "options": {}
+      },
+      "typeVersion": 4.2
+    },
+    {
+      "id": "blink1",
+      "name": "Post to Blink",
+      "type": "n8n-nodes-base.httpRequest",
+      "position": [680, 300],
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.joinblink.com/v2/feed/post",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Authorization", "value": "Bearer {{$vars.BLINK_API_TOKEN}}" }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "json",
+        "specifyBody": "json",
+        "jsonBody": {
+          "category": "={{$vars.BLINK_CATEGORY}}",
+          "title": "Good Morning — Anchor Group",
+          "body": "={{$json.choices[0].message.content}}"
+        },
+        "options": {}
+      },
+      "typeVersion": 4.2
+    }
+  ],
+  "connections": {
+    "Schedule 7:30 AM": {
+      "main": [[{ "node": "Draft Briefing", "type": "main", "index": 0 }]]
+    },
+    "Draft Briefing": {
+      "main": [[{ "node": "Post to Blink", "type": "main", "index": 0 }]]
+    }
+  },
+  "settings": { "executionOrder": "v1" }
+}
