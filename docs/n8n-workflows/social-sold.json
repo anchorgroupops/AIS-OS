@@ -1,0 +1,173 @@
+{
+  "name": "Social - SOLD Post",
+  "nodes": [
+    {
+      "id": "webhook-fub",
+      "name": "FUB SOLD Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "position": [240, 300],
+      "parameters": {
+        "path": "fub-sold",
+        "httpMethod": "POST",
+        "responseMode": "responseNode"
+      },
+      "typeVersion": 2
+    },
+    {
+      "id": "respond-fub",
+      "name": "Respond 200",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "position": [460, 420],
+      "parameters": { "respondWith": "text", "responseBody": "ok" },
+      "typeVersion": 1.1
+    },
+    {
+      "id": "extract-details",
+      "name": "Extract Property Details",
+      "type": "n8n-nodes-base.set",
+      "position": [460, 300],
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            { "id": "a1", "name": "address", "value": "={{$json.body.property?.address ?? $json.property?.address ?? 'Address TBD'}}", "type": "string" },
+            { "id": "a2", "name": "city", "value": "={{$json.body.property?.city ?? $json.property?.city ?? 'Palm Coast'}}", "type": "string" },
+            { "id": "a3", "name": "price", "value": "={{$json.body.property?.price ?? $json.property?.price ?? ''}}", "type": "string" },
+            { "id": "a4", "name": "beds", "value": "={{$json.body.property?.bedrooms ?? $json.property?.bedrooms ?? ''}}", "type": "string" },
+            { "id": "a5", "name": "baths", "value": "={{$json.body.property?.bathrooms ?? $json.property?.bathrooms ?? ''}}", "type": "string" },
+            { "id": "a6", "name": "agent", "value": "={{$json.body.agent?.name ?? $json.agent?.name ?? 'the team'}}", "type": "string" },
+            { "id": "a7", "name": "agentEmail", "value": "={{$json.body.agent?.email ?? $json.agent?.email ?? ''}}", "type": "string" },
+            { "id": "a8", "name": "buyer", "value": "={{($json.body.contact?.first_name ?? $json.contact?.first_name ?? '') + ' ' + ($json.body.contact?.last_name ?? $json.contact?.last_name ?? '')}}", "type": "string" }
+          ]
+        }
+      },
+      "typeVersion": 3.4
+    },
+    {
+      "id": "ai-generate",
+      "name": "Generate SOLD Post",
+      "type": "n8n-nodes-base.httpRequest",
+      "position": [680, 300],
+      "parameters": {
+        "method": "POST",
+        "url": "https://openrouter.ai/api/v1/chat/completions",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Authorization", "value": "Bearer {{$vars.OPENROUTER_API_KEY}}" },
+            { "name": "HTTP-Referer", "value": "https://n8n.joelycannoli.com" }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "json",
+        "specifyBody": "json",
+        "jsonBody": {
+          "model": "anthropic/claude-haiku-4-5",
+          "max_tokens": 500,
+          "messages": [
+            {
+              "role": "system",
+              "content": "You write real estate social media posts for The Anchor Group in Palm Coast, Florida. Brand: 'Dolphins, Not Sharks' — collaborative, celebratory, never pushy. Fair Housing compliant. SOLD posts celebrate the transaction and agent excellence. 50-120 words. End with: — The Anchor Group 🏡"
+            },
+            {
+              "role": "user",
+              "content": "=Write 2 SOLD post variations for:\nAddress: {{$json.address}}, {{$json.city}}, FL\nSale Price: ${{$json.price}}\nBeds/Baths: {{$json.beds}} bed / {{$json.baths}} bath\nAgent: {{$json.agent}}\n\nWrite exactly 2 variations labeled CELEBRATORY: and GRATEFUL: (each on its own line). Celebratory is upbeat and milestone-focused. Grateful emphasizes the client journey and agent dedication. Both 50-120 words."
+            }
+          ]
+        },
+        "options": {}
+      },
+      "typeVersion": 4.2
+    },
+    {
+      "id": "parse-posts",
+      "name": "Parse Variations",
+      "type": "n8n-nodes-base.code",
+      "position": [900, 300],
+      "parameters": {
+        "jsCode": "const raw = $input.first().json.choices[0].message.content;\nconst props = $('Extract Property Details').first().json;\n\nfunction extract(label) {\n  const regex = new RegExp(label + ':?\\\\s*([\\\\s\\\\S]*?)(?=(?:CELEBRATORY:|GRATEFUL:|$))', 'i');\n  const m = raw.match(regex);\n  return m ? m[1].trim() : '';\n}\n\nreturn [{\n  json: {\n    celebratory: extract('CELEBRATORY'),\n    grateful: extract('GRATEFUL'),\n    address: props.address,\n    city: props.city,\n    agent: props.agent,\n    agentEmail: props.agentEmail,\n    webhookBase: $vars.N8N_BASE_URL ?? 'https://n8n.joelycannoli.com'\n  }\n}];"
+      },
+      "typeVersion": 2
+    },
+    {
+      "id": "send-email",
+      "name": "Email Agent — SOLD Approval",
+      "type": "n8n-nodes-base.emailSend",
+      "position": [1120, 300],
+      "parameters": {
+        "fromEmail": "anchorgroupops@gmail.com",
+        "toEmail": "={{$json.agentEmail}}",
+        "subject": "=SOLD! Post ready — {{$json.address}}",
+        "emailFormat": "html",
+        "html": "=<p>Hi {{$json.agent}},</p><p>Congratulations on the close! The AI drafted 2 SOLD post options for <strong>{{$json.address}}, {{$json.city}}</strong>. One click posts it.</p><hr/><p><strong>🎉 CELEBRATORY</strong><br/>{{$json.celebratory}}<br/><a href='{{$json.webhookBase}}/webhook/sold-approve?tone=celebratory&addr={{encodeURIComponent($json.address)}}' style='background:#157676;color:#fff;padding:8px 16px;text-decoration:none;border-radius:4px;display:inline-block;margin-top:8px'>Approve & Post</a></p><hr/><p><strong>🙏 GRATEFUL</strong><br/>{{$json.grateful}}<br/><a href='{{$json.webhookBase}}/webhook/sold-approve?tone=grateful&addr={{encodeURIComponent($json.address)}}' style='background:#03466e;color:#fff;padding:8px 16px;text-decoration:none;border-radius:4px;display:inline-block;margin-top:8px'>Approve & Post</a></p><hr/><p style='color:#888;font-size:12px'>Anchor Group AI — automated post system</p>"
+      },
+      "credentials": { "smtp": { "id": "gmail-smtp", "name": "AnchorGroupOps Gmail" } },
+      "typeVersion": 2.1
+    },
+    {
+      "id": "webhook-approve",
+      "name": "SOLD Approve Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "position": [240, 560],
+      "parameters": {
+        "path": "sold-approve",
+        "httpMethod": "GET",
+        "responseMode": "responseNode"
+      },
+      "typeVersion": 2
+    },
+    {
+      "id": "post-facebook",
+      "name": "Post to Facebook",
+      "type": "n8n-nodes-base.httpRequest",
+      "position": [460, 560],
+      "parameters": {
+        "method": "POST",
+        "url": "=https://graph.facebook.com/v19.0/{{$vars.META_PAGE_ID}}/feed",
+        "sendBody": true,
+        "contentType": "json",
+        "specifyBody": "json",
+        "jsonBody": {
+          "message": "={{$json.query.content ?? 'SOLD post approved.'}}",
+          "access_token": "={{$vars.META_PAGE_ACCESS_TOKEN}}"
+        },
+        "options": {}
+      },
+      "typeVersion": 4.2
+    },
+    {
+      "id": "respond-approve",
+      "name": "Respond Approved",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "position": [680, 560],
+      "parameters": {
+        "respondWith": "html",
+        "responseBody": "<html><body style='font-family:sans-serif;text-align:center;padding:40px'><h2 style='color:#157676'>✓ SOLD post published!</h2><p>The post has been posted to the Anchor Group Facebook page.</p></body></html>"
+      },
+      "typeVersion": 1.1
+    }
+  ],
+  "connections": {
+    "FUB SOLD Webhook": {
+      "main": [
+        [{ "node": "Extract Property Details", "type": "main", "index": 0 }],
+        [{ "node": "Respond 200", "type": "main", "index": 0 }]
+      ]
+    },
+    "Extract Property Details": {
+      "main": [[{ "node": "Generate SOLD Post", "type": "main", "index": 0 }]]
+    },
+    "Generate SOLD Post": {
+      "main": [[{ "node": "Parse Variations", "type": "main", "index": 0 }]]
+    },
+    "Parse Variations": {
+      "main": [[{ "node": "Email Agent — SOLD Approval", "type": "main", "index": 0 }]]
+    },
+    "SOLD Approve Webhook": {
+      "main": [[{ "node": "Post to Facebook", "type": "main", "index": 0 }]]
+    },
+    "Post to Facebook": {
+      "main": [[{ "node": "Respond Approved", "type": "main", "index": 0 }]]
+    }
+  },
+  "settings": { "executionOrder": "v1" }
+}
