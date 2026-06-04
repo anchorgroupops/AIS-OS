@@ -1,13 +1,14 @@
 {
   "name": "FUB Social Router",
   "_notes": [
-    "Single FUB webhook (ID 51) handles all dealsUpdated events.",
-    "Routes to Under Contract or SOLD flow based on deal stage.",
-    "Auth: URL token in ?token= query param (FUB does not support HMAC signing).",
-    "Token stored in H:\\AI\\Secrets\\.env.master.private as FUB_SOCIAL_WEBHOOK_TOKEN.",
-    "After routing, spawns the appropriate sub-flow (UC or SOLD) via n8n internal call.",
-    "Add FUB API key as HTTP Basic Auth credential 'FUB API' (username=key, password=blank).",
-    "IMPORTANT: The token is hardcoded below — update if rotating the secret."
+    "FUB webhook ID 52 (dealsUpdated) routes to this endpoint.",
+    "Auth: URL token from process.env.FUB_SOCIAL_WEBHOOK_TOKEN + timingSafeEqual.",
+    "Token set in /opt/n8n-production/docker-compose.yml environment section.",
+    "Requires n8n container restart to activate env var: sudo docker stop n8n && sudo docker start n8n",
+    "Token also in H:\\AI\\Secrets\\.env.master.private as FUB_SOCIAL_WEBHOOK_TOKEN.",
+    "Draft tokens expire after 24 hours (AND created_at > now() - interval '24 hours').",
+    "All FUB fields sanitized before LLM interpolation (length caps + char allowlist).",
+    "OpenRouter key: process.env.OPENROUTER_API_KEY — same env section as FUB token."
   ],
   "nodes": [
     {
@@ -36,7 +37,7 @@
       "type": "n8n-nodes-base.code",
       "position": [460, 300],
       "parameters": {
-        "jsCode": "// Auth: verify URL token (FUB does not sign outbound webhooks with HMAC)\nconst EXPECTED_TOKEN = 'cea22c644a16fc779a7b9615d9fee5c8dcf3a4091cfb21aa';\nconst incoming = $input.first().json.query?.token ?? '';\nif (incoming !== EXPECTED_TOKEN) throw new Error('Invalid webhook token');\n\n// Extract deal stage from FUB payload\nconst b = $input.first().json.body ?? {};\nconst stage = (b.deal?.stage ?? b.stage ?? b.deals?.[0]?.stage ?? '').toLowerCase();\nconst agentEmail = b.agent?.email ?? b.deal?.agent?.email ?? '';\nconst prop = b.deal?.property ?? b.property ?? b.deals?.[0]?.property ?? {};\n\nconst isUC   = /under.?contract|in.?contract/i.test(stage);\nconst isSold = /closed|sold|settlement/i.test(stage);\n\nreturn [{ json: {\n  stage,\n  isUC,\n  isSold,\n  skip: !isUC && !isSold,\n  address:    prop.address ?? 'Address TBD',\n  city:       prop.city ?? 'Palm Coast',\n  price:      prop.price ?? b.deal?.value ?? '',\n  beds:       prop.bedrooms ?? '',\n  baths:      prop.bathrooms ?? '',\n  agent:      b.agent?.name ?? 'the team',\n  agentEmail\n}}];"
+        "jsCode": "// Auth: URL token from process.env ($vars is Enterprise-only; process.env works on community)\n// Token set in n8n Docker env as FUB_SOCIAL_WEBHOOK_TOKEN (in docker-compose.yml environment section).\n// Requires n8n container restart to activate — run: sudo docker stop n8n && sudo docker start n8n\nconst crypto = require('crypto');\nconst EXPECTED = process.env.FUB_SOCIAL_WEBHOOK_TOKEN;\nif (!EXPECTED) throw new Error('FUB_SOCIAL_WEBHOOK_TOKEN not configured in n8n environment');\nconst incoming = $input.first().json.query?.token ?? '';\nif (incoming.length !== EXPECTED.length) throw new Error('Invalid token');\nif (!crypto.timingSafeEqual(Buffer.from(incoming), Buffer.from(EXPECTED))) throw new Error('Invalid token');\n\n// Sanitize FUB fields before LLM interpolation (prompt injection mitigation)\nfunction sanitize(s, maxLen) {\n  return String(s ?? '').replace(/[^\\w\\s,.$#@!&()/'.-]/g, '').trim().slice(0, maxLen);\n}\n\n// Extract deal stage from FUB payload\nconst payload = $input.first().json.body ?? {};\nconst stage = (payload.deal?.stage ?? payload.stage ?? payload.deals?.[0]?.stage ?? '').toLowerCase();\nconst agentEmail = payload.agent?.email ?? payload.deal?.agent?.email ?? '';\nconst prop = payload.deal?.property ?? payload.property ?? payload.deals?.[0]?.property ?? {};\n\nconst isUC   = /under.?contract|in.?contract/i.test(stage);\nconst isSold = /closed|sold|settlement/i.test(stage);\n\nreturn [{ json: {\n  stage, isUC, isSold,\n  skip: !isUC && !isSold,\n  address: sanitize(prop.address ?? 'Address TBD', 120),\n  city:    sanitize(prop.city ?? 'Palm Coast', 60),\n  price:   sanitize(String(prop.price ?? payload.deal?.value ?? ''), 20),\n  beds:    sanitize(String(prop.bedrooms ?? ''), 5),\n  baths:   sanitize(String(prop.bathrooms ?? ''), 5),\n  agent:   sanitize(payload.agent?.name ?? 'the team', 80),\n  agentEmail\n}}];"
       },
       "typeVersion": 2
     },
@@ -61,7 +62,7 @@
         "url": "https://openrouter.ai/api/v1/chat/completions",
         "sendHeaders": true,
         "headerParameters": { "parameters": [
-          { "name": "Authorization", "value": "Bearer {{$vars.OPENROUTER_API_KEY}}" },
+          { "name": "Authorization", "value": "Bearer {{$env.OPENROUTER_API_KEY}}" },
           { "name": "HTTP-Referer", "value": "https://n8n.joelycannoli.com" }
         ]},
         "sendBody": true, "contentType": "json", "specifyBody": "json",
@@ -85,7 +86,7 @@
         "url": "https://openrouter.ai/api/v1/chat/completions",
         "sendHeaders": true,
         "headerParameters": { "parameters": [
-          { "name": "Authorization", "value": "Bearer {{$vars.OPENROUTER_API_KEY}}" },
+          { "name": "Authorization", "value": "Bearer {{$env.OPENROUTER_API_KEY}}" },
           { "name": "HTTP-Referer", "value": "https://n8n.joelycannoli.com" }
         ]},
         "sendBody": true, "contentType": "json", "specifyBody": "json",
@@ -262,7 +263,7 @@
       "position": [680, 780],
       "parameters": {
         "operation": "executeQuery",
-        "query": "UPDATE nightshift.social_drafts SET consumed=true,consumed_at=now() WHERE id=$1 AND consumed=false RETURNING id,content,tone",
+        "query": "UPDATE nightshift.social_drafts SET consumed=true,consumed_at=now() WHERE id=$1 AND consumed=false AND created_at > now() - interval '24 hours' RETURNING id,content,tone",
         "additionalFields": { "queryParams": "={{JSON.stringify([$json.token])}}" },
         "options": {}
       },
@@ -382,7 +383,7 @@
       "position": [680, 1260],
       "parameters": {
         "operation": "executeQuery",
-        "query": "UPDATE nightshift.social_drafts SET consumed=true,consumed_at=now() WHERE id=$1 AND consumed=false RETURNING id,content,tone",
+        "query": "UPDATE nightshift.social_drafts SET consumed=true,consumed_at=now() WHERE id=$1 AND consumed=false AND created_at > now() - interval '24 hours' RETURNING id,content,tone",
         "additionalFields": { "queryParams": "={{JSON.stringify([$json.token])}}" },
         "options": {}
       },
