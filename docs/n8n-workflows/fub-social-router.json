@@ -1,0 +1,481 @@
+{
+  "name": "FUB Social Router",
+  "_notes": [
+    "Single FUB webhook (ID 51) handles all dealsUpdated events.",
+    "Routes to Under Contract or SOLD flow based on deal stage.",
+    "Auth: URL token in ?token= query param (FUB does not support HMAC signing).",
+    "Token stored in H:\\AI\\Secrets\\.env.master.private as FUB_SOCIAL_WEBHOOK_TOKEN.",
+    "After routing, spawns the appropriate sub-flow (UC or SOLD) via n8n internal call.",
+    "Add FUB API key as HTTP Basic Auth credential 'FUB API' (username=key, password=blank).",
+    "IMPORTANT: The token is hardcoded below — update if rotating the secret."
+  ],
+  "nodes": [
+    {
+      "id": "webhook-router",
+      "name": "FUB dealsUpdated",
+      "type": "n8n-nodes-base.webhook",
+      "position": [240, 300],
+      "parameters": {
+        "path": "fub-social-router",
+        "httpMethod": "POST",
+        "responseMode": "responseNode"
+      },
+      "typeVersion": 2
+    },
+    {
+      "id": "respond-ok",
+      "name": "Respond 200",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "position": [460, 480],
+      "parameters": { "respondWith": "text", "responseBody": "ok" },
+      "typeVersion": 1.1
+    },
+    {
+      "id": "auth-and-route",
+      "name": "Auth + Extract Stage",
+      "type": "n8n-nodes-base.code",
+      "position": [460, 300],
+      "parameters": {
+        "jsCode": "// Auth: verify URL token (FUB does not sign outbound webhooks with HMAC)\nconst EXPECTED_TOKEN = 'cea22c644a16fc779a7b9615d9fee5c8dcf3a4091cfb21aa';\nconst incoming = $input.first().json.query?.token ?? '';\nif (incoming !== EXPECTED_TOKEN) throw new Error('Invalid webhook token');\n\n// Extract deal stage from FUB payload\nconst b = $input.first().json.body ?? {};\nconst stage = (b.deal?.stage ?? b.stage ?? b.deals?.[0]?.stage ?? '').toLowerCase();\nconst agentEmail = b.agent?.email ?? b.deal?.agent?.email ?? '';\nconst prop = b.deal?.property ?? b.property ?? b.deals?.[0]?.property ?? {};\n\nconst isUC   = /under.?contract|in.?contract/i.test(stage);\nconst isSold = /closed|sold|settlement/i.test(stage);\n\nreturn [{ json: {\n  stage,\n  isUC,\n  isSold,\n  skip: !isUC && !isSold,\n  address:    prop.address ?? 'Address TBD',\n  city:       prop.city ?? 'Palm Coast',\n  price:      prop.price ?? b.deal?.value ?? '',\n  beds:       prop.bedrooms ?? '',\n  baths:      prop.bathrooms ?? '',\n  agent:      b.agent?.name ?? 'the team',\n  agentEmail\n}}];"
+      },
+      "typeVersion": 2
+    },
+    {
+      "id": "route",
+      "name": "Route: UC or SOLD?",
+      "type": "n8n-nodes-base.switch",
+      "position": [680, 300],
+      "parameters": {
+        "mode": "expression",
+        "output": "={{$json.skip ? 2 : $json.isUC ? 0 : 1}}"
+      },
+      "typeVersion": 3.2
+    },
+    {
+      "id": "ai-uc",
+      "name": "Generate UC Variations",
+      "type": "n8n-nodes-base.httpRequest",
+      "position": [900, 180],
+      "parameters": {
+        "method": "POST",
+        "url": "https://openrouter.ai/api/v1/chat/completions",
+        "sendHeaders": true,
+        "headerParameters": { "parameters": [
+          { "name": "Authorization", "value": "Bearer {{$vars.OPENROUTER_API_KEY}}" },
+          { "name": "HTTP-Referer", "value": "https://n8n.joelycannoli.com" }
+        ]},
+        "sendBody": true, "contentType": "json", "specifyBody": "json",
+        "jsonBody": {
+          "model": "anthropic/claude-haiku-4-5", "max_tokens": 600,
+          "messages": [
+            { "role": "system", "content": "You write real estate social media posts for The Anchor Group in Palm Coast, Florida. Brand: Dolphins Not Sharks. Fair Housing compliant: no schools, crime, or neighborhood demographics. Posts 50-100 words. End with: — The Anchor Group" },
+            { "role": "user", "content": "=Write 3 Under Contract posts.\nProperty: {{$json.address}}, {{$json.city}}, FL\nPrice: ${{$json.price}} | {{$json.beds}} bed / {{$json.baths}} bath\nAgent: {{$json.agent}}\n\nWrite exactly 3 variations labeled COASTAL:, FAMILY:, and LUXURY: on separate lines. Each 50-100 words. Celebrate the milestone warmly." }
+          ]
+        }, "options": {}
+      },
+      "typeVersion": 4.2
+    },
+    {
+      "id": "ai-sold",
+      "name": "Generate SOLD Variations",
+      "type": "n8n-nodes-base.httpRequest",
+      "position": [900, 300],
+      "parameters": {
+        "method": "POST",
+        "url": "https://openrouter.ai/api/v1/chat/completions",
+        "sendHeaders": true,
+        "headerParameters": { "parameters": [
+          { "name": "Authorization", "value": "Bearer {{$vars.OPENROUTER_API_KEY}}" },
+          { "name": "HTTP-Referer", "value": "https://n8n.joelycannoli.com" }
+        ]},
+        "sendBody": true, "contentType": "json", "specifyBody": "json",
+        "jsonBody": {
+          "model": "anthropic/claude-haiku-4-5", "max_tokens": 500,
+          "messages": [
+            { "role": "system", "content": "You write real estate social media posts for The Anchor Group in Palm Coast, Florida. Brand: Dolphins Not Sharks. Fair Housing compliant. SOLD posts celebrate the transaction. 50-120 words. End with: — The Anchor Group" },
+            { "role": "user", "content": "=Write 2 SOLD post variations.\nProperty: {{$json.address}}, {{$json.city}}, FL\nSale Price: ${{$json.price}} | {{$json.beds}} bed / {{$json.baths}} bath\nAgent: {{$json.agent}}\n\nWrite exactly 2 variations labeled CELEBRATORY: and GRATEFUL: on separate lines. Each 50-120 words." }
+          ]
+        }, "options": {}
+      },
+      "typeVersion": 4.2
+    },
+    {
+      "id": "store-uc",
+      "name": "Store UC Drafts",
+      "type": "n8n-nodes-base.code",
+      "position": [1120, 180],
+      "parameters": {
+        "jsCode": "const crypto = require('crypto');\nconst raw = $input.first().json.choices[0].message.content;\nconst prev = $('Auth + Extract Stage').first().json;\nfunction esc(s){return String(s??'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/\"/g,'&quot;').replace(/'/g,'&#39;');}\nfunction extract(label){\n  const r = new RegExp(label+':?\\\\s*([\\\\s\\\\S]*?)(?=(?:COASTAL:|FAMILY:|LUXURY:|$))','i');\n  const m = raw.match(r); return m?m[1].trim():'';\n}\nconst drafts=[\n  {tone:'Coastal',content:extract('COASTAL')},\n  {tone:'Family',content:extract('FAMILY')},\n  {tone:'Luxury',content:extract('LUXURY')}\n].filter(d=>d.content);\nreturn drafts.map(d=>({json:{token:crypto.randomUUID(),workflow:'under-contract',tone:d.tone,content:d.content,address:esc(prev.address),city:esc(prev.city),agent:esc(prev.agent),agentEmail:prev.agentEmail}}));"
+      },
+      "typeVersion": 2
+    },
+    {
+      "id": "store-sold",
+      "name": "Store SOLD Drafts",
+      "type": "n8n-nodes-base.code",
+      "position": [1120, 300],
+      "parameters": {
+        "jsCode": "const crypto = require('crypto');\nconst raw = $input.first().json.choices[0].message.content;\nconst prev = $('Auth + Extract Stage').first().json;\nfunction esc(s){return String(s??'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/\"/g,'&quot;').replace(/'/g,'&#39;');}\nfunction extract(label){\n  const r = new RegExp(label+':?\\\\s*([\\\\s\\\\S]*?)(?=(?:CELEBRATORY:|GRATEFUL:|$))','i');\n  const m = raw.match(r); return m?m[1].trim():'';\n}\nconst drafts=[\n  {tone:'Celebratory',content:extract('CELEBRATORY')},\n  {tone:'Grateful',content:extract('GRATEFUL')}\n].filter(d=>d.content);\nreturn drafts.map(d=>({json:{token:crypto.randomUUID(),workflow:'sold',tone:d.tone,content:d.content,address:esc(prev.address),city:esc(prev.city),agent:esc(prev.agent),agentEmail:prev.agentEmail}}));"
+      },
+      "typeVersion": 2
+    },
+    {
+      "id": "persist-drafts",
+      "name": "Persist Drafts",
+      "type": "n8n-nodes-base.postgres",
+      "position": [1340, 240],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO nightshift.social_drafts (id, workflow, address, tone, content, agent_email) VALUES ($1, $2, $3, $4, $5, $6)",
+        "additionalFields": { "queryParams": "={{JSON.stringify([$json.token, $json.workflow, $json.address, $json.tone, $json.content, $json.agentEmail])}}" },
+        "options": {}
+      },
+      "credentials": { "postgres": { "id": "postgres-pi", "name": "Pi Postgres" } },
+      "typeVersion": 2.5
+    },
+    {
+      "id": "collect-uc",
+      "name": "Collect UC Tokens",
+      "type": "n8n-nodes-base.aggregate",
+      "position": [1560, 180],
+      "parameters": {
+        "fieldsToAggregate": { "fieldToAggregate": [
+          { "fieldToAggregate": "token" }, { "fieldToAggregate": "tone" },
+          { "fieldToAggregate": "address" }, { "fieldToAggregate": "agent" },
+          { "fieldToAggregate": "agentEmail" }
+        ]}
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "collect-sold",
+      "name": "Collect SOLD Tokens",
+      "type": "n8n-nodes-base.aggregate",
+      "position": [1560, 300],
+      "parameters": {
+        "fieldsToAggregate": { "fieldToAggregate": [
+          { "fieldToAggregate": "token" }, { "fieldToAggregate": "tone" },
+          { "fieldToAggregate": "address" }, { "fieldToAggregate": "agent" },
+          { "fieldToAggregate": "agentEmail" }
+        ]}
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "email-uc",
+      "name": "Email UC Approval",
+      "type": "n8n-nodes-base.emailSend",
+      "position": [1780, 180],
+      "parameters": {
+        "fromEmail": "anchorgroupops@gmail.com",
+        "toEmail": "={{$json.agentEmail[0]}}",
+        "subject": "=Under Contract post ready — {{$json.address[0]}}",
+        "emailFormat": "html",
+        "html": "=<p>Hi {{$json.agent[0]}},</p><p>3 post options ready for <strong>{{$json.address[0]}}, FL</strong>. Click to preview — nothing posts until you confirm.</p><p style='margin-top:16px'>{{$json.tone.map((tone,i)=>'<a href=\"https://n8n.joelycannoli.com/webhook/uc-confirm?token='+$json.token[i]+'\" style=\"background:#157676;color:#fff;padding:8px 16px;text-decoration:none;border-radius:4px;display:inline-block;margin-right:8px\">' + tone + '</a>').join(' ')}}</p><p style='color:#888;font-size:12px;margin-top:16px'>— Anchor Group AI | Nothing posts until you confirm.</p>"
+      },
+      "credentials": { "smtp": { "id": "gmail-smtp", "name": "AnchorGroupOps Gmail" } },
+      "typeVersion": 2.1
+    },
+    {
+      "id": "email-sold",
+      "name": "Email SOLD Approval",
+      "type": "n8n-nodes-base.emailSend",
+      "position": [1780, 300],
+      "parameters": {
+        "fromEmail": "anchorgroupops@gmail.com",
+        "toEmail": "={{$json.agentEmail[0]}}",
+        "subject": "=SOLD! Post ready — {{$json.address[0]}}",
+        "emailFormat": "html",
+        "html": "=<p>Congrats {{$json.agent[0]}}! 2 SOLD post options for <strong>{{$json.address[0]}}, FL</strong>. Click to preview — nothing posts until you confirm.</p><p style='margin-top:16px'>{{$json.tone.map((tone,i)=>'<a href=\"https://n8n.joelycannoli.com/webhook/sold-confirm?token='+$json.token[i]+'\" style=\"background:#03466e;color:#fff;padding:8px 16px;text-decoration:none;border-radius:4px;display:inline-block;margin-right:8px\">' + tone + '</a>').join(' ')}}</p><p style='color:#888;font-size:12px;margin-top:16px'>— Anchor Group AI | Nothing posts until you confirm.</p>"
+      },
+      "credentials": { "smtp": { "id": "gmail-smtp", "name": "AnchorGroupOps Gmail" } },
+      "typeVersion": 2.1
+    },
+    {
+      "id": "webhook-uc-confirm",
+      "name": "UC Confirm Page",
+      "type": "n8n-nodes-base.webhook",
+      "position": [240, 600],
+      "parameters": { "path": "uc-confirm", "httpMethod": "GET", "responseMode": "responseNode" },
+      "typeVersion": 2
+    },
+    {
+      "id": "validate-uc-token",
+      "name": "Validate UC Token",
+      "type": "n8n-nodes-base.code",
+      "position": [460, 600],
+      "parameters": { "jsCode": "const t=$input.first().json.query?.token??'';if(!/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(t))throw new Error('Invalid token');return [{json:{token:t}}];" },
+      "typeVersion": 2
+    },
+    {
+      "id": "lookup-uc",
+      "name": "Look Up UC Draft",
+      "type": "n8n-nodes-base.postgres",
+      "position": [680, 600],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT id, tone, content, consumed FROM nightshift.social_drafts WHERE id = $1",
+        "additionalFields": { "queryParams": "={{JSON.stringify([$json.token])}}" },
+        "options": {}
+      },
+      "credentials": { "postgres": { "id": "postgres-pi", "name": "Pi Postgres" } },
+      "typeVersion": 2.5
+    },
+    {
+      "id": "prepare-uc-html",
+      "name": "Prepare UC Safe HTML",
+      "type": "n8n-nodes-base.code",
+      "position": [900, 600],
+      "parameters": {
+        "jsCode": "const row=$input.first().json;if(!row||!row.id)return[{json:{html:'<!DOCTYPE html><html><body style=\"font-family:sans-serif;text-align:center;padding:60px\"><h2 style=\"color:#c00\">Draft not found.</h2></body></html>'}}];\nfunction esc(s){return String(s??'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/\"/g,'&quot;').replace(/'/g,'&#39;');}\nconst tone=esc(row.tone),content=esc(row.content),id=esc(row.id);\nconst body=row.consumed?'<p style=\"color:#c00\">Already published.</p>':`<pre style=\"background:#f5f5f5;padding:16px;border-radius:6px;white-space:pre-wrap;font-family:inherit\">${content}</pre><form method=\"POST\" action=\"https://n8n.joelycannoli.com/webhook/uc-post\"><input type=\"hidden\" name=\"token\" value=\"${id}\"/><button style=\"background:#157676;color:#fff;padding:12px 24px;border:none;border-radius:4px;font-size:16px;cursor:pointer\">Confirm &amp; Post</button></form>`;\nreturn[{json:{html:`<!DOCTYPE html><html><head><meta charset=\"utf-8\"><meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none';style-src 'unsafe-inline';form-action https://n8n.joelycannoli.com\"></head><body style=\"font-family:sans-serif;max-width:600px;margin:40px auto;padding:0 20px\"><h2 style=\"color:#157676\">Under Contract &mdash; ${tone}</h2>${body}</body></html>`}}];"
+      },
+      "typeVersion": 2
+    },
+    {
+      "id": "render-uc",
+      "name": "Render UC Page",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "position": [1120, 600],
+      "parameters": { "respondWith": "html", "responseBody": "={{$json.html}}" },
+      "typeVersion": 1.1
+    },
+    {
+      "id": "webhook-uc-post",
+      "name": "UC Publish POST",
+      "type": "n8n-nodes-base.webhook",
+      "position": [240, 780],
+      "parameters": { "path": "uc-post", "httpMethod": "POST", "responseMode": "responseNode" },
+      "typeVersion": 2
+    },
+    {
+      "id": "validate-uc-post",
+      "name": "Validate UC Publish Token",
+      "type": "n8n-nodes-base.code",
+      "position": [460, 780],
+      "parameters": { "jsCode": "const t=$input.first().json.body?.token??'';if(!/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(t))throw new Error('Invalid token');return [{json:{token:t}}];" },
+      "typeVersion": 2
+    },
+    {
+      "id": "consume-uc",
+      "name": "Consume UC Draft",
+      "type": "n8n-nodes-base.postgres",
+      "position": [680, 780],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE nightshift.social_drafts SET consumed=true,consumed_at=now() WHERE id=$1 AND consumed=false RETURNING id,content,tone",
+        "additionalFields": { "queryParams": "={{JSON.stringify([$json.token])}}" },
+        "options": {}
+      },
+      "credentials": { "postgres": { "id": "postgres-pi", "name": "Pi Postgres" } },
+      "typeVersion": 2.5
+    },
+    {
+      "id": "uc-check-consumed",
+      "name": "UC Already Used?",
+      "type": "n8n-nodes-base.if",
+      "position": [900, 780],
+      "parameters": {
+        "conditions": { "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "strict" },
+          "conditions": [{ "leftValue": "={{$json.length}}", "rightValue": 0, "operator": { "type": "number", "operation": "equals" } }] },
+        "combineOperation": "all"
+      },
+      "typeVersion": 2.2
+    },
+    {
+      "id": "post-fb-uc",
+      "name": "Post UC to Facebook",
+      "type": "n8n-nodes-base.httpRequest",
+      "position": [1120, 780],
+      "parameters": {
+        "method": "POST",
+        "url": "=https://graph.facebook.com/v19.0/{{$vars.META_PAGE_ID}}/feed",
+        "sendBody": true, "contentType": "json", "specifyBody": "json",
+        "jsonBody": { "message": "={{$json[0].content}}", "access_token": "={{$vars.META_PAGE_ACCESS_TOKEN}}" },
+        "options": {}
+      },
+      "typeVersion": 4.2
+    },
+    {
+      "id": "respond-uc-done",
+      "name": "UC Published",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "position": [1340, 780],
+      "parameters": { "respondWith": "html", "responseBody": "<!DOCTYPE html><html><body style='font-family:sans-serif;text-align:center;padding:60px'><h2 style='color:#157676'>&#x2713; Published!</h2><p>Under Contract post is live on Facebook.</p></body></html>" },
+      "typeVersion": 1.1
+    },
+    {
+      "id": "respond-uc-used",
+      "name": "UC Already Used",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "position": [1120, 900],
+      "parameters": { "respondWith": "html", "responseBody": "<!DOCTYPE html><html><body style='font-family:sans-serif;text-align:center;padding:60px'><h2 style='color:#c00'>Link already used.</h2></body></html>" },
+      "typeVersion": 1.1
+    },
+    {
+      "id": "webhook-sold-confirm",
+      "name": "SOLD Confirm Page",
+      "type": "n8n-nodes-base.webhook",
+      "position": [240, 1080],
+      "parameters": { "path": "sold-confirm", "httpMethod": "GET", "responseMode": "responseNode" },
+      "typeVersion": 2
+    },
+    {
+      "id": "validate-sold-token",
+      "name": "Validate SOLD Token",
+      "type": "n8n-nodes-base.code",
+      "position": [460, 1080],
+      "parameters": { "jsCode": "const t=$input.first().json.query?.token??'';if(!/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(t))throw new Error('Invalid token');return [{json:{token:t}}];" },
+      "typeVersion": 2
+    },
+    {
+      "id": "lookup-sold",
+      "name": "Look Up SOLD Draft",
+      "type": "n8n-nodes-base.postgres",
+      "position": [680, 1080],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT id, tone, content, consumed FROM nightshift.social_drafts WHERE id = $1",
+        "additionalFields": { "queryParams": "={{JSON.stringify([$json.token])}}" },
+        "options": {}
+      },
+      "credentials": { "postgres": { "id": "postgres-pi", "name": "Pi Postgres" } },
+      "typeVersion": 2.5
+    },
+    {
+      "id": "prepare-sold-html",
+      "name": "Prepare SOLD Safe HTML",
+      "type": "n8n-nodes-base.code",
+      "position": [900, 1080],
+      "parameters": {
+        "jsCode": "const row=$input.first().json;if(!row||!row.id)return[{json:{html:'<!DOCTYPE html><html><body style=\"font-family:sans-serif;text-align:center;padding:60px\"><h2 style=\"color:#c00\">Draft not found.</h2></body></html>'}}];\nfunction esc(s){return String(s??'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/\"/g,'&quot;').replace(/'/g,'&#39;');}\nconst tone=esc(row.tone),content=esc(row.content),id=esc(row.id);\nconst body=row.consumed?'<p style=\"color:#c00\">Already published.</p>':`<pre style=\"background:#f5f5f5;padding:16px;border-radius:6px;white-space:pre-wrap;font-family:inherit\">${content}</pre><form method=\"POST\" action=\"https://n8n.joelycannoli.com/webhook/sold-post\"><input type=\"hidden\" name=\"token\" value=\"${id}\"/><button style=\"background:#03466e;color:#fff;padding:12px 24px;border:none;border-radius:4px;font-size:16px;cursor:pointer\">Confirm &amp; Post</button></form>`;\nreturn[{json:{html:`<!DOCTYPE html><html><head><meta charset=\"utf-8\"><meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none';style-src 'unsafe-inline';form-action https://n8n.joelycannoli.com\"></head><body style=\"font-family:sans-serif;max-width:600px;margin:40px auto;padding:0 20px\"><h2 style=\"color:#03466e\">SOLD &mdash; ${tone}</h2>${body}</body></html>`}}];"
+      },
+      "typeVersion": 2
+    },
+    {
+      "id": "render-sold",
+      "name": "Render SOLD Page",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "position": [1120, 1080],
+      "parameters": { "respondWith": "html", "responseBody": "={{$json.html}}" },
+      "typeVersion": 1.1
+    },
+    {
+      "id": "webhook-sold-post",
+      "name": "SOLD Publish POST",
+      "type": "n8n-nodes-base.webhook",
+      "position": [240, 1260],
+      "parameters": { "path": "sold-post", "httpMethod": "POST", "responseMode": "responseNode" },
+      "typeVersion": 2
+    },
+    {
+      "id": "validate-sold-post",
+      "name": "Validate SOLD Publish Token",
+      "type": "n8n-nodes-base.code",
+      "position": [460, 1260],
+      "parameters": { "jsCode": "const t=$input.first().json.body?.token??'';if(!/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(t))throw new Error('Invalid token');return [{json:{token:t}}];" },
+      "typeVersion": 2
+    },
+    {
+      "id": "consume-sold",
+      "name": "Consume SOLD Draft",
+      "type": "n8n-nodes-base.postgres",
+      "position": [680, 1260],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE nightshift.social_drafts SET consumed=true,consumed_at=now() WHERE id=$1 AND consumed=false RETURNING id,content,tone",
+        "additionalFields": { "queryParams": "={{JSON.stringify([$json.token])}}" },
+        "options": {}
+      },
+      "credentials": { "postgres": { "id": "postgres-pi", "name": "Pi Postgres" } },
+      "typeVersion": 2.5
+    },
+    {
+      "id": "sold-check-consumed",
+      "name": "SOLD Already Used?",
+      "type": "n8n-nodes-base.if",
+      "position": [900, 1260],
+      "parameters": {
+        "conditions": { "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "strict" },
+          "conditions": [{ "leftValue": "={{$json.length}}", "rightValue": 0, "operator": { "type": "number", "operation": "equals" } }] },
+        "combineOperation": "all"
+      },
+      "typeVersion": 2.2
+    },
+    {
+      "id": "post-fb-sold",
+      "name": "Post SOLD to Facebook",
+      "type": "n8n-nodes-base.httpRequest",
+      "position": [1120, 1260],
+      "parameters": {
+        "method": "POST",
+        "url": "=https://graph.facebook.com/v19.0/{{$vars.META_PAGE_ID}}/feed",
+        "sendBody": true, "contentType": "json", "specifyBody": "json",
+        "jsonBody": { "message": "={{$json[0].content}}", "access_token": "={{$vars.META_PAGE_ACCESS_TOKEN}}" },
+        "options": {}
+      },
+      "typeVersion": 4.2
+    },
+    {
+      "id": "respond-sold-done",
+      "name": "SOLD Published",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "position": [1340, 1260],
+      "parameters": { "respondWith": "html", "responseBody": "<!DOCTYPE html><html><body style='font-family:sans-serif;text-align:center;padding:60px'><h2 style='color:#03466e'>&#x2713; Published!</h2><p>SOLD post is live on Facebook.</p></body></html>" },
+      "typeVersion": 1.1
+    },
+    {
+      "id": "respond-sold-used",
+      "name": "SOLD Already Used",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "position": [1120, 1380],
+      "parameters": { "respondWith": "html", "responseBody": "<!DOCTYPE html><html><body style='font-family:sans-serif;text-align:center;padding:60px'><h2 style='color:#c00'>Link already used.</h2></body></html>" },
+      "typeVersion": 1.1
+    }
+  ],
+  "connections": {
+    "FUB dealsUpdated": { "main": [
+      [{ "node": "Auth + Extract Stage", "type": "main", "index": 0 }],
+      [{ "node": "Respond 200", "type": "main", "index": 0 }]
+    ]},
+    "Auth + Extract Stage": { "main": [[{ "node": "Route: UC or SOLD?", "type": "main", "index": 0 }]] },
+    "Route: UC or SOLD?": { "main": [
+      [{ "node": "Generate UC Variations", "type": "main", "index": 0 }],
+      [{ "node": "Generate SOLD Variations", "type": "main", "index": 0 }]
+    ]},
+    "Generate UC Variations":   { "main": [[{ "node": "Store UC Drafts", "type": "main", "index": 0 }]] },
+    "Generate SOLD Variations": { "main": [[{ "node": "Store SOLD Drafts", "type": "main", "index": 0 }]] },
+    "Store UC Drafts":   { "main": [[{ "node": "Persist Drafts", "type": "main", "index": 0 }]] },
+    "Store SOLD Drafts": { "main": [[{ "node": "Persist Drafts", "type": "main", "index": 0 }]] },
+    "Persist Drafts": { "main": [
+      [{ "node": "Collect UC Tokens", "type": "main", "index": 0 }],
+      [{ "node": "Collect SOLD Tokens", "type": "main", "index": 0 }]
+    ]},
+    "Collect UC Tokens":   { "main": [[{ "node": "Email UC Approval", "type": "main", "index": 0 }]] },
+    "Collect SOLD Tokens": { "main": [[{ "node": "Email SOLD Approval", "type": "main", "index": 0 }]] },
+    "UC Confirm Page":   { "main": [[{ "node": "Validate UC Token", "type": "main", "index": 0 }]] },
+    "Validate UC Token": { "main": [[{ "node": "Look Up UC Draft", "type": "main", "index": 0 }]] },
+    "Look Up UC Draft":  { "main": [[{ "node": "Prepare UC Safe HTML", "type": "main", "index": 0 }]] },
+    "Prepare UC Safe HTML": { "main": [[{ "node": "Render UC Page", "type": "main", "index": 0 }]] },
+    "UC Publish POST":         { "main": [[{ "node": "Validate UC Publish Token", "type": "main", "index": 0 }]] },
+    "Validate UC Publish Token": { "main": [[{ "node": "Consume UC Draft", "type": "main", "index": 0 }]] },
+    "Consume UC Draft":        { "main": [[{ "node": "UC Already Used?", "type": "main", "index": 0 }]] },
+    "UC Already Used?":        { "main": [
+      [{ "node": "Post UC to Facebook", "type": "main", "index": 0 }],
+      [{ "node": "UC Already Used", "type": "main", "index": 0 }]
+    ]},
+    "Post UC to Facebook": { "main": [[{ "node": "UC Published", "type": "main", "index": 0 }]] },
+    "SOLD Confirm Page":    { "main": [[{ "node": "Validate SOLD Token", "type": "main", "index": 0 }]] },
+    "Validate SOLD Token":  { "main": [[{ "node": "Look Up SOLD Draft", "type": "main", "index": 0 }]] },
+    "Look Up SOLD Draft":   { "main": [[{ "node": "Prepare SOLD Safe HTML", "type": "main", "index": 0 }]] },
+    "Prepare SOLD Safe HTML": { "main": [[{ "node": "Render SOLD Page", "type": "main", "index": 0 }]] },
+    "SOLD Publish POST":          { "main": [[{ "node": "Validate SOLD Publish Token", "type": "main", "index": 0 }]] },
+    "Validate SOLD Publish Token": { "main": [[{ "node": "Consume SOLD Draft", "type": "main", "index": 0 }]] },
+    "Consume SOLD Draft":          { "main": [[{ "node": "SOLD Already Used?", "type": "main", "index": 0 }]] },
+    "SOLD Already Used?":          { "main": [
+      [{ "node": "Post SOLD to Facebook", "type": "main", "index": 0 }],
+      [{ "node": "SOLD Already Used", "type": "main", "index": 0 }]
+    ]},
+    "Post SOLD to Facebook": { "main": [[{ "node": "SOLD Published", "type": "main", "index": 0 }]] }
+  },
+  "settings": { "executionOrder": "v1" }
+}
